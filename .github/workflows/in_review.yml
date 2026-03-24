@@ -13,99 +13,143 @@ jobs:
   move:
     runs-on: ubuntu-latest
     steps:
-      - name: Move linked issues to In Review
+      - name: Move linked issues to In Review with detailed logs
         uses: actions/github-script@v7
         with:
           script: |
-            const body = context.payload.pull_request.body || "";
-            const issueNumbers = Array.from(body.matchAll(/#(\d+)/g), m => parseInt(m[1], 10));
+            console.log("🟢 Iniciando workflow para mover issues a 'In review'");
 
-            if (!issueNumbers.length) {
-              console.log("ℹ️ No se encontraron issues en la descripción del PR");
-              return;
-            }
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
 
-            console.log("🔎 Issues detectados:", issueNumbers);
-
-            for (const number of issueNumbers) {
-              // Obtener issue por número
-              const { data: issueData } = await github.rest.issues.get({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: number
-              });
-
-              const issueNodeId = issueData.node_id;
-
-              // Obtener proyectos donde este issue es item
-              const itemData = await github.graphql(`
-                query($issueId: ID!) {
-                  node(id: $issueId) {
-                    ... on Issue {
-                      projectItems(first: 10) {
+            // 1️⃣ Obtener Projects V2 en el repo
+            const projectsData = await github.graphql(`
+              query($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) {
+                  projectsV2(first: 10) {
+                    nodes {
+                      id
+                      title
+                      fields(first: 20) {
                         nodes {
-                          id
-                          project {
-                            ... on ProjectV2 {
-                              id
-                              fields(first: 20) {
-                                nodes {
-                                  __typename
-                                  ... on ProjectV2SingleSelectField { id name }
-                                }
-                              }
-                            }
-                          }
+                          __typename
+                          ... on ProjectV2FieldCommon { id name }
+                          ... on ProjectV2SingleSelectField { id name options { id name } }
                         }
                       }
                     }
                   }
                 }
-              `, { issueId: issueNodeId });
+              }
+            `, { owner, repo });
 
-              for (const item of itemData.node.projectItems.nodes) {
-                const project = item.project;
-                const statusField = project.fields.nodes.find(
-                  f => f.__typename === "ProjectV2SingleSelectField" &&
-                       f.name.toLowerCase() === "status"
-                );
-                if (!statusField) continue;
+            if (!projectsData.repository.projectsV2.nodes.length) {
+              console.log("❌ No se encontraron Projects V2 en el repositorio");
+              return;
+            }
 
-                // Obtener opción "In Review"
-                const optionsData = await github.graphql(`
-                  query($fieldId: ID!) {
-                    node(id: $fieldId) {
-                      ... on ProjectV2SingleSelectField {
-                        options { id name }
+            const project = projectsData.repository.projectsV2.nodes[0];
+            console.log(`✔️ Project encontrado: ${project.title} (${project.id})`);
+
+            // 2️⃣ Buscar campo Status
+            const statusField = project.fields.nodes.find(f => f.__typename === "ProjectV2SingleSelectField" && f.name.toLowerCase() === "status");
+            if (!statusField) {
+              console.log("❌ No se encontró el campo 'Status' en el Project");
+              return;
+            }
+            console.log(`✔️ Campo 'Status' encontrado: ${statusField.id}`);
+
+            // 3️⃣ Buscar opción "In review"
+            const inReviewOption = statusField.options.find(o => o.name.toLowerCase() === "in review");
+            if (!inReviewOption) {
+              console.log("❌ No existe la opción 'In review' en el campo Status");
+              console.log("Opciones disponibles:", statusField.options.map(o => o.name));
+              return;
+            }
+            console.log(`✔️ Opción 'In review' encontrada: ${inReviewOption.id}`);
+
+            // 4️⃣ Obtener issues vinculados al PR
+            const prNodeId = context.payload.pull_request.node_id;
+            console.log(`ℹ️ PR node_id: ${prNodeId}`);
+
+            const prData = await github.graphql(`
+              query {
+                node(id: "${prNodeId}") {
+                  ... on PullRequest {
+                    closingIssuesReferences(first: 10) {
+                      nodes { id number }
+                    }
+                  }
+                }
+              }
+            `);
+
+            const issues = prData.node.closingIssuesReferences.nodes;
+            console.log(`🔎 Issues detectados:`, issues.map(i => i.number));
+
+            if (issues.length === 0) {
+              console.log("ℹ️ No hay issues vinculados al PR");
+              return;
+            }
+
+            // 5️⃣ Procesar cada issue
+            for (const issue of issues) {
+              console.log(`--- Procesando Issue #${issue.number} ---`);
+
+              // Obtener items del Project para el issue
+              const itemData = await github.graphql(`
+                query {
+                  node(id: "${issue.id}") {
+                    ... on Issue {
+                      projectItems(first: 10) {
+                        nodes { id }
                       }
                     }
                   }
-                `, { fieldId: statusField.id });
+                }
+              `);
 
-                const inReviewOption = optionsData.node.options.find(
-                  o => o.name.toLowerCase() === "in review"
-                );
-                if (!inReviewOption) continue;
+              let itemId = itemData.node.projectItems.nodes[0]?.id;
+              if (!itemId) {
+                console.log(`⚠️ Issue #${issue.number} NO está en el Project, se intentará agregar`);
 
-                // Actualizar campo Status
+                try {
+                  const addItem = await github.graphql(`
+                    mutation($projectId: ID!, $issueId: ID!) {
+                      addProjectV2ItemById(input: { projectId: $projectId, contentId: $issueId }) {
+                        item { id }
+                      }
+                    }
+                  `, { projectId: project.id, issueId: issue.id });
+
+                  itemId = addItem.addProjectV2ItemById.item.id;
+                  console.log(`➕ Issue #${issue.number} agregado al Project con itemId ${itemId}`);
+                } catch (error) {
+                  console.log(`❌ Error al agregar Issue #${issue.number} al Project:`, error.message);
+                  continue;
+                }
+              } else {
+                console.log(`✔️ Issue #${issue.number} ya está en el Project con itemId ${itemId}`);
+              }
+
+              // Actualizar campo Status a In Review
+              try {
                 await github.graphql(`
-                  mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: ID!) {
+                  mutation {
                     updateProjectV2ItemFieldValue(input: {
-                      projectId: $projectId,
-                      itemId: $itemId,
-                      fieldId: $fieldId,
-                      value: { singleSelectOptionId: $optionId }
+                      projectId: "${project.id}",
+                      itemId: "${itemId}",
+                      fieldId: "${statusField.id}",
+                      value: { singleSelectOptionId: "${inReviewOption.id}" }
                     }) {
                       projectV2Item { id }
                     }
                   }
-                `, {
-                  projectId: project.id,
-                  itemId: item.id,
-                  fieldId: statusField.id,
-                  optionId: inReviewOption.id
-                });
-
-                console.log(`✔️ Issue #${number} movido a In Review en Project ${project.id}`);
+                `);
+                console.log(`✅ Issue #${issue.number} movido a 'In review'`);
+              } catch (error) {
+                console.log(`❌ Error al mover Issue #${issue.number}:`, error.message);
               }
             }
+
+            console.log("🟢 Workflow finalizado");
