@@ -1,0 +1,78 @@
+name: Update Branch Docs
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - develop  # Solo PR hacia develop
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    concurrency:
+      group: docs-writer
+      cancel-in-progress: false
+
+    permissions:
+      contents: write  # Necesario para commit/push
+
+    steps:
+      # 1️⃣ Checkout de la rama del PR
+      - name: Checkout head branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0  # trae todo el historial
+
+      # 2️⃣ Setup Node
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 3️⃣ Fetch completo para poder calcular merge-base
+      - name: Fetch full history
+        run: |
+          git fetch origin develop --depth=1000
+          git fetch --all --prune
+          git fetch origin "+refs/heads/*:refs/remotes/origin/*"
+
+      # 4️⃣ Ejecutar script usando HEAD en la rama del PR
+      - name: Run update-hechos script
+        run: node .github/scripts/update-hechos.js
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
+
+      # 5️⃣ Cambiar a docs-update para commit/push
+      - name: Prepare docs-update branch
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          if git show-ref --verify --quiet refs/remotes/origin/docs-update; then
+            git checkout -B docs-update origin/docs-update
+          else
+            git checkout -b docs-update
+          fi
+
+      # 6️⃣ Commit cambios
+      - name: Commit docs changes
+        run: |
+          git add docs/Historial/Hechos
+          git commit -m "docs: regenerate hechos" || echo "No changes to commit"
+          git push origin docs-update
+
+      # 7️⃣ Merge a docs
+      - name: Merge into docs branch
+        run: |
+          git fetch origin
+          if git show-ref --verify --quiet refs/remotes/origin/docs; then
+            git checkout -B docs origin/docs
+          else
+            git checkout -b docs
+            git push origin docs
+          fi
+          git merge docs-update --no-edit || echo "Nothing to merge"
+          git push origin docs

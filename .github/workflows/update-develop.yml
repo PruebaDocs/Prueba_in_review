@@ -1,0 +1,73 @@
+name: Update Develop Docs
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - develop
+
+jobs:
+  update:
+    if: github.event.pull_request.merged == true
+
+    runs-on: ubuntu-latest
+
+    concurrency:
+      group: docs-writer
+      cancel-in-progress: false
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 1. Cambiar a docs-update antes de ejecutar el script
+      - name: Prepare docs-update branch
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git fetch origin
+
+          if git show-ref --verify --quiet refs/remotes/origin/docs-update; then
+            echo "La rama docs-update existe"
+            git checkout -B docs-update origin/docs-update
+          else
+            echo "La rama docs-update no existe, creándola"
+            git checkout -b docs-update
+          fi
+
+      # 2. Ejecutar el script dentro de docs-update
+      - name: Run update-develop script
+        run: node .github/scripts/update-develop.js
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 3. Commit SOLO de Develop.md
+      - name: Commit docs changes
+        run: |
+          git add docs/Historial/Develop.md
+          git commit -m "docs: update develop history" || true
+          git push origin docs-update
+
+      # 4. Merge docs-update → docs
+      - name: Merge into docs branch
+        run: |
+          git fetch origin
+
+          if git show-ref --verify --quiet refs/remotes/origin/docs; then
+            git checkout -B docs origin/docs
+          else
+            git checkout -b docs
+            git push origin docs
+          fi
+
+          git merge docs-update --no-edit || true
+          git push origin docs
