@@ -17,13 +17,16 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            // 1️⃣ Obtener Projects y fields
+            const owner = context.repo.owner;
+
+            // 1️⃣ Obtener Projects de la ORGANIZACIÓN
             const projectsData = await github.graphql(`
-              query($owner: String!, $repo: String!) {
-                repository(owner: $owner, name: $repo) {
-                  projectsV2(first: 10) {
+              query($owner: String!) {
+                organization(login: $owner) {
+                  projectsV2(first: 20) {
                     nodes {
                       id
+                      title
                       fields(first: 20) {
                         nodes {
                           __typename
@@ -35,23 +38,34 @@ jobs:
                   }
                 }
               }
-            `, { owner: context.repo.owner, repo: context.repo.repo });
+            `, { owner });
 
-            const project = projectsData.repository.projectsV2.nodes[0];
+            // Cambia esto por el nombre EXACTO de tu Project
+            const projectName = "PruebaDocs";  // <-- AJUSTA ESTE NOMBRE
+
+            const project = projectsData.organization.projectsV2.nodes
+              .find(p => p.title === projectName);
+
             if (!project) {
-              console.log("No Projects found in repo");
+              console.log("❌ No se encontró el Project en la organización");
               return;
             }
 
+            console.log("✔️ Project encontrado:", project.title, project.id);
+
+            // 2️⃣ Buscar campo Status
             const statusField = project.fields.nodes.find(
               f => f.__typename === "ProjectV2SingleSelectField" && f.name === "Status"
             );
+
             if (!statusField) {
-              console.log("No Status field found in Project");
+              console.log("❌ No se encontró el campo Status");
               return;
             }
 
-            // 2️⃣ Obtener options del campo Status
+            console.log("✔️ Campo Status encontrado:", statusField.id);
+
+            // 3️⃣ Obtener opciones del campo Status
             const fieldOptionsData = await github.graphql(`
               query($fieldId: ID!) {
                 node(id: $fieldId) {
@@ -65,18 +79,18 @@ jobs:
             const inReviewOption = fieldOptionsData.node.options.find(
               o => o.name === "In review"
             );
+
             if (!inReviewOption) {
-              console.log("No 'In review' option found in Status field");
-              console.log("Opciones:", fieldOptionsData.node.options);
+              console.log("❌ No existe la opción 'In review'");
+              console.log("Opciones disponibles:", fieldOptionsData.node.options);
               return;
             }
 
-            console.log("ProjectId:", project.id);
-            console.log("StatusFieldId:", statusField.id);
-            console.log("InReviewOptionId:", inReviewOption.id);
+            console.log("✔️ Opción In review encontrada:", inReviewOption.id);
 
-            // 3️⃣ Obtener issues vinculados al PR
+            // 4️⃣ Obtener issues vinculados al PR
             const prNodeId = context.payload.pull_request.node_id;
+
             const prData = await github.graphql(`
               query {
                 node(id: "${prNodeId}") {
@@ -89,7 +103,15 @@ jobs:
               }
             `);
 
-            for (const issue of prData.node.closingIssuesReferences.nodes) {
+            const issues = prData.node.closingIssuesReferences.nodes;
+
+            if (issues.length === 0) {
+              console.log("ℹ️ No hay issues vinculados al PR");
+              return;
+            }
+
+            // 5️⃣ Actualizar cada issue en el Project
+            for (const issue of issues) {
               const itemData = await github.graphql(`
                 query {
                   node(id: "${issue.id}") {
@@ -102,14 +124,14 @@ jobs:
                 }
               `);
 
-              let itemId = itemData.node.projectItems.nodes[0]?.id;
+              const itemId = itemData.node.projectItems.nodes[0]?.id;
 
               if (!itemId) {
-                console.log(`Issue ${issue.id} no tiene item en el Project, se ignorará.`);
+                console.log(`⚠️ Issue ${issue.id} no tiene item en el Project`);
                 continue;
               }
 
-              console.log(`Updating Issue ${issue.id}, ItemId: ${itemId}`);
+              console.log(`➡️ Moviendo Issue ${issue.id} a In review`);
 
               await github.graphql(`
                 mutation {
@@ -124,5 +146,5 @@ jobs:
                 }
               `);
 
-              console.log(`Issue ${issue.id} movido a 'In review'`);
+              console.log(`✔️ Issue ${issue.id} movido a In review`);
             }
