@@ -1,4 +1,4 @@
-name: Move linked issues to In Review
+name: Move issues to In Review
 
 on:
   pull_request:
@@ -17,31 +17,27 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const prNodeId = context.payload.pull_request.node_id;
+            const body = context.payload.pull_request.body || "";
+            const issueNumbers = Array.from(body.matchAll(/#(\d+)/g), m => parseInt(m[1], 10));
 
-            // 1️⃣ Obtener issues vinculados al PR
-            const prData = await github.graphql(`
-              query($prNodeId: ID!) {
-                node(id: $prNodeId) {
-                  ... on PullRequest {
-                    closingIssuesReferences(first: 10) {
-                      nodes {
-                        id
-                      }
-                    }
-                  }
-                }
-              }
-            `, { prNodeId });
-
-            const issues = prData.node.closingIssuesReferences.nodes;
-            if (!issues.length) {
-              console.log("ℹ️ No hay issues vinculados al PR");
+            if (!issueNumbers.length) {
+              console.log("ℹ️ No se encontraron issues en la descripción del PR");
               return;
             }
 
-            for (const issue of issues) {
-              // 2️⃣ Obtener Projects donde este issue ya es item
+            console.log("🔎 Issues detectados:", issueNumbers);
+
+            for (const number of issueNumbers) {
+              // Obtener issue por número
+              const { data: issueData } = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: number
+              });
+
+              const issueNodeId = issueData.node_id;
+
+              // Obtener proyectos donde este issue es item
               const itemData = await github.graphql(`
                 query($issueId: ID!) {
                   node(id: $issueId) {
@@ -65,7 +61,7 @@ jobs:
                     }
                   }
                 }
-              `, { issueId: issue.id });
+              `, { issueId: issueNodeId });
 
               for (const item of itemData.node.projectItems.nodes) {
                 const project = item.project;
@@ -75,7 +71,7 @@ jobs:
                 );
                 if (!statusField) continue;
 
-                // 3️⃣ Obtener opción "In Review"
+                // Obtener opción "In Review"
                 const optionsData = await github.graphql(`
                   query($fieldId: ID!) {
                     node(id: $fieldId) {
@@ -91,7 +87,7 @@ jobs:
                 );
                 if (!inReviewOption) continue;
 
-                // 4️⃣ Actualizar campo Status
+                // Actualizar campo Status
                 await github.graphql(`
                   mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: ID!) {
                     updateProjectV2ItemFieldValue(input: {
@@ -110,6 +106,6 @@ jobs:
                   optionId: inReviewOption.id
                 });
 
-                console.log(`✔️ Issue ${issue.id} movido a In Review en Project ${project.id}`);
+                console.log(`✔️ Issue #${number} movido a In Review en Project ${project.id}`);
               }
             }
