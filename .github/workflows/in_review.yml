@@ -1,155 +1,103 @@
-name: Move issues to In Review
+name: Move Issue to In Review on PR to develop
 
 on:
   pull_request:
-    types: [opened, reopened]
-
-permissions:
-  contents: read
-  issues: write
-  pull-requests: write
+    types: [opened]
+    branches:
+      - develop
 
 jobs:
-  move:
+  move_issue:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+
     steps:
-      - name: Move linked issues to In Review with detailed logs
-        uses: actions/github-script@v7
-        with:
-          script: |
-            console.log("🟢 Iniciando workflow para mover issues a 'In review'");
+      - name: Extraer número de issue del cuerpo del PR
+        id: extract
+        run: |
+          ISSUE_NUMBER=$(echo "${{ github.event.pull_request.body }}" | grep -oE 'Fixes #[0-9]+' | grep -oE '[0-9]+')
+          if [ -z "$ISSUE_NUMBER" ]; then
+            echo "No se encontró un issue en el cuerpo del PR"
+            exit 1
+          fi
+          echo "issue=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
 
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-
-            // 1️⃣ Obtener Projects V2 en el repo
-            const projectsData = await github.graphql(`
-              query($owner: String!, $repo: String!) {
-                repository(owner: $owner, name: $repo) {
-                  projectsV2(first: 10) {
-                    nodes {
+      - name: Obtener datos del issue y sus items en proyectos
+        id: issue_data
+        run: |
+          QUERY='
+          query {
+            repository(owner: "'${{ github.repository_owner }}'", name: "'${{ github.event.repository.name }}'") {
+              issue(number: '${{ steps.extract.outputs.issue }}') {
+                id
+                projectItems(first: 20) {
+                  nodes {
+                    id
+                    project {
                       id
                       title
-                      fields(first: 20) {
+                      fields(first: 50) {
                         nodes {
-                          __typename
-                          ... on ProjectV2FieldCommon { id name }
-                          ... on ProjectV2SingleSelectField { id name options { id name } }
+                          ... on ProjectV2SingleSelectField {
+                            id
+                            name
+                            options {
+                              id
+                              name
+                            }
+                          }
                         }
                       }
                     }
                   }
                 }
               }
-            `, { owner, repo });
-
-            if (!projectsData.repository.projectsV2.nodes.length) {
-              console.log("❌ No se encontraron Projects V2 en el repositorio");
-              return;
             }
+          }'
 
-            const project = projectsData.repository.projectsV2.nodes[0];
-            console.log(`✔️ Project encontrado: ${project.title} (${project.id})`);
+          RESPONSE=$(gh api graphql -f query="$QUERY")
 
-            // 2️⃣ Buscar campo Status
-            const statusField = project.fields.nodes.find(f => f.__typename === "ProjectV2SingleSelectField" && f.name.toLowerCase() === "status");
-            if (!statusField) {
-              console.log("❌ No se encontró el campo 'Status' en el Project");
-              return;
-            }
-            console.log(`✔️ Campo 'Status' encontrado: ${statusField.id}`);
+          echo "$RESPONSE" > response.json
 
-            // 3️⃣ Buscar opción "In review"
-            const inReviewOption = statusField.options.find(o => o.name.toLowerCase() === "in review");
-            if (!inReviewOption) {
-              console.log("❌ No existe la opción 'In review' en el campo Status");
-              console.log("Opciones disponibles:", statusField.options.map(o => o.name));
-              return;
-            }
-            console.log(`✔️ Opción 'In review' encontrada: ${inReviewOption.id}`);
+      - name: Detectar item del proyecto, campo Status y opción In review
+        id: detect
+        run: |
+          ITEM_ID=$(jq -r '.data.repository.issue.projectItems.nodes[0].id' response.json)
+          PROJECT_ID=$(jq -r '.data.repository.issue.projectItems.nodes[0].project.id' response.json)
 
-            // 4️⃣ Obtener issues vinculados al PR
-            const prNodeId = context.payload.pull_request.node_id;
-            console.log(`ℹ️ PR node_id: ${prNodeId}`);
+          STATUS_FIELD_ID=$(jq -r '.data.repository.issue.projectItems.nodes[0].project.fields.nodes[] | select(.name=="Status") | .id' response.json)
+          IN_REVIEW_OPTION_ID=$(jq -r '.data.repository.issue.projectItems.nodes[0].project.fields.nodes[] | select(.name=="Status") | .options[] | select(.name=="In review") | .id' response.json)
 
-            const prData = await github.graphql(`
-              query {
-                node(id: "${prNodeId}") {
-                  ... on PullRequest {
-                    closingIssuesReferences(first: 10) {
-                      nodes { id number }
-                    }
-                  }
-                }
+          if [ -z "$ITEM_ID" ] || [ -z "$STATUS_FIELD_ID" ] || [ -z "$IN_REVIEW_OPTION_ID" ]; then
+            echo "No se pudo detectar item, campo Status u opción In review"
+            exit 1
+          fi
+
+          echo "item=$ITEM_ID" >> $GITHUB_OUTPUT
+          echo "project=$PROJECT_ID" >> $GITHUB_OUTPUT
+          echo "status_field=$STATUS_FIELD_ID" >> $GITHUB_OUTPUT
+          echo "in_review=$IN_REVIEW_OPTION_ID" >> $GITHUB_OUTPUT
+
+      - name: Mover issue a In review
+        run: |
+          MUTATION='
+          mutation {
+            updateProjectV2ItemFieldValue(
+              input: {
+                projectId: "'${{ steps.detect.outputs.project }}'",
+                itemId: "'${{ steps.detect.outputs.item }}'",
+                fieldId: "'${{ steps.detect.outputs.status_field }}'",
+                value: { singleSelectOptionId: "'${{ steps.detect.outputs.in_review }}'" }
               }
-            `);
-
-            const issues = prData.node.closingIssuesReferences.nodes;
-            console.log(`🔎 Issues detectados:`, issues.map(i => i.number));
-
-            if (issues.length === 0) {
-              console.log("ℹ️ No hay issues vinculados al PR");
-              return;
-            }
-
-            // 5️⃣ Procesar cada issue
-            for (const issue of issues) {
-              console.log(`--- Procesando Issue #${issue.number} ---`);
-
-              // Obtener items del Project para el issue
-              const itemData = await github.graphql(`
-                query {
-                  node(id: "${issue.id}") {
-                    ... on Issue {
-                      projectItems(first: 10) {
-                        nodes { id }
-                      }
-                    }
-                  }
-                }
-              `);
-
-              let itemId = itemData.node.projectItems.nodes[0]?.id;
-              if (!itemId) {
-                console.log(`⚠️ Issue #${issue.number} NO está en el Project, se intentará agregar`);
-
-                try {
-                  const addItem = await github.graphql(`
-                    mutation($projectId: ID!, $issueId: ID!) {
-                      addProjectV2ItemById(input: { projectId: $projectId, contentId: $issueId }) {
-                        item { id }
-                      }
-                    }
-                  `, { projectId: project.id, issueId: issue.id });
-
-                  itemId = addItem.addProjectV2ItemById.item.id;
-                  console.log(`➕ Issue #${issue.number} agregado al Project con itemId ${itemId}`);
-                } catch (error) {
-                  console.log(`❌ Error al agregar Issue #${issue.number} al Project:`, error.message);
-                  continue;
-                }
-              } else {
-                console.log(`✔️ Issue #${issue.number} ya está en el Project con itemId ${itemId}`);
-              }
-
-              // Actualizar campo Status a In Review
-              try {
-                await github.graphql(`
-                  mutation {
-                    updateProjectV2ItemFieldValue(input: {
-                      projectId: "${project.id}",
-                      itemId: "${itemId}",
-                      fieldId: "${statusField.id}",
-                      value: { singleSelectOptionId: "${inReviewOption.id}" }
-                    }) {
-                      projectV2Item { id }
-                    }
-                  }
-                `);
-                console.log(`✅ Issue #${issue.number} movido a 'In review'`);
-              } catch (error) {
-                console.log(`❌ Error al mover Issue #${issue.number}:`, error.message);
+            ) {
+              projectV2Item {
+                id
               }
             }
+          }'
 
-            console.log("🟢 Workflow finalizado");
+          gh api graphql -f query="$MUTATION"
