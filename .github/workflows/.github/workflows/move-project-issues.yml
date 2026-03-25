@@ -1,0 +1,137 @@
+name: Move PR issues in Project automatically
+
+on:
+  pull_request:
+    branches:
+      - develop
+
+env:
+  APP_ID: 3181703                       # Tu App ID
+  INSTALLATION_ID: 118884602              # Tu Installation ID
+  PROJECT_ID: project_abc123            # Project V2 ID
+
+jobs:
+  move_issue:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y nodejs npm jq curl
+
+    - name: Generate JWT
+      id: generate_jwt
+      run: |
+        cat > generate_jwt.js <<'EOF'
+        const fs = require('fs');
+        const jwt = require('jsonwebtoken');
+
+        const appId = process.env.APP_ID;
+        const privateKey = process.env.PRIVATE_KEY.replace(/\\n/g, '\n');
+
+        const token = jwt.sign(
+          { iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + (10*60), iss: appId },
+          privateKey,
+          { algorithm: 'RS256' }
+        );
+
+        console.log(token);
+        EOF
+
+        npm install jsonwebtoken
+        JWT=$(node generate_jwt.js)
+        echo "jwt=$JWT" >> $GITHUB_OUTPUT
+
+    - name: Get Installation Token
+      id: get_token
+      run: |
+        TOKEN=$(curl -s -X POST \
+          -H "Authorization: Bearer ${{ steps.generate_jwt.outputs.jwt }}" \
+          -H "Accept: application/vnd.github+json" \
+          https://api.github.com/app/installations/${{ env.INSTALLATION_ID }}/access_tokens \
+          | jq -r '.token')
+        echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+    - name: Get Project v2 ID for this repo
+      id: get_project
+      run: |
+        PROJECT_ID=$(curl -s -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+          -H "Accept: application/vnd.github+json" \
+          -X POST https://api.github.com/graphql \
+          -d "{\"query\": \"query { repository(owner: \\\"${{ github.repository_owner }}\\\", name: \\\"${{ github.event.repository.name }}\\\") { projectsV2(first:1) { nodes { id title } } } }\"}" \
+          | jq -r '.data.repository.projectsV2.nodes[0].id')
+        echo "project_id=$PROJECT_ID" >> $GITHUB_OUTPUT
+
+    - name: Get Columns IDs
+      id: get_columns
+      run: |
+        QUERY=$(cat <<EOF
+        query {
+          node(id: "${{ steps.get_project.outputs.project_id }}") {
+            ... on ProjectV2 {
+              fields(first: 20) {
+                nodes {
+                  ... on ProjectV2SingleSelectField {
+                    id
+                    name
+                  }
+                }
+              }
+            }
+          }
+        }
+        EOF
+        )
+
+        RESPONSE=$(curl -s -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+          -H "Accept: application/vnd.github+json" \
+          -X POST https://api.github.com/graphql \
+          -d "{\"query\": \"${QUERY//\"/\\\"}\"}")
+
+        IN_PROGRESS_ID=$(echo $RESPONSE | jq -r '.data.node.fields.nodes[] | select(.name=="In progress") | .id')
+        IN_REVIEW_ID=$(echo $RESPONSE | jq -r '.data.node.fields.nodes[] | select(.name=="In review") | .id')
+        DONE_ID=$(echo $RESPONSE | jq -r '.data.node.fields.nodes[] | select(.name=="Done") | .id')
+
+        echo "in_progress_id=$IN_PROGRESS_ID" >> $GITHUB_OUTPUT
+        echo "in_review_id=$IN_REVIEW_ID" >> $GITHUB_OUTPUT
+        echo "done_id=$DONE_ID" >> $GITHUB_OUTPUT
+
+    - name: Extract Issue Number
+      id: get_issue
+      run: |
+        ISSUE=$(echo "${{ github.event.pull_request.body }}" | grep -oE "Fixes #[0-9]+" | grep -oE "[0-9]+")
+        echo "issue=$ISSUE" >> $GITHUB_OUTPUT
+
+    - name: Determine Column
+      id: select_column
+      run: |
+        if [ "${{ github.event.action }}" == "opened" ]; then
+          COLUMN=${{ steps.get_columns.outputs.in_review_id }}
+        elif [ "${{ github.event.action }}" == "closed" ]; then
+          if [ "${{ github.event.pull_request.merged }}" == "true" ]; then
+            COLUMN=${{ steps.get_columns.outputs.done_id }}
+          else
+            COLUMN=${{ steps.get_columns.outputs.in_progress_id }}
+          fi
+        fi
+        echo "column=$COLUMN" >> $GITHUB_OUTPUT
+
+    - name: Move Issue in Project
+      run: |
+        # Añadir issue al Project (si aún no está)
+        ITEM_ID=$(curl -s -X POST \
+          -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+          -H "Accept: application/vnd.github+json" \
+          -d "{\"query\": \"mutation { addProjectV2Item(input: {projectId: \\\"${{ steps.get_project.outputs.project_id }}\\\", contentId: \\\"${{ steps.get_issue.outputs.issue }}\\\"}) { item { id } } }\"}" \
+          https://api.github.com/graphql | jq -r '.data.addProjectV2Item.item.id')
+
+        # Mover issue a la columna correspondiente
+        curl -s -X POST \
+          -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+          -H "Accept: application/vnd.github+json" \
+          -d "{\"query\": \"mutation { moveProjectV2Item(input: {itemId: \\\"$ITEM_ID\\\", targetColumnId: \\\"${{ steps.select_column.outputs.column }}\\\"}) { item { id } } }\"}" \
+          https://api.github.com/graphql
