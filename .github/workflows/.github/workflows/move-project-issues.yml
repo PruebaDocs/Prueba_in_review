@@ -4,6 +4,11 @@ on:
   pull_request:
     branches:
       - develop
+    types:
+      - opened      # cuando se abre un PR
+      - edited      # cuando se edita (título, descripción)
+      - reopened    # si se reabre un PR
+      - closed      # si se cierra un PR
 
 env:
   APP_ID: 3181703                       # Tu App ID
