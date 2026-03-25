@@ -10,7 +10,6 @@ on:
     branches:
       - develop
 
-
 jobs:
   move_issue:
     runs-on: ubuntu-latest
@@ -34,8 +33,35 @@ jobs:
           fi
           echo "issue=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
 
-      - name: Obtener datos del issue y sus items en proyectos
-        id: issue_data
+      - name: Buscar Project por nombre del repositorio
+        id: project
+        run: |
+          PROJECT_NAME="${{ github.event.repository.name }}"
+
+          QUERY='
+          query {
+            organization(login: "'${{ github.repository_owner }}'") {
+              projectsV2(first: 50, query: "'$PROJECT_NAME'") {
+                nodes {
+                  id
+                  title
+                }
+              }
+            }
+          }'
+
+          RESPONSE=$(gh api graphql -f query="$QUERY")
+          PROJECT_ID=$(echo "$RESPONSE" | jq -r '.data.organization.projectsV2.nodes[] | select(.title=="'${{ github.event.repository.name }}'") | .id')
+
+          if [ -z "$PROJECT_ID" ]; then
+            echo "No se encontró un Project con el nombre del repositorio"
+            exit 1
+          fi
+
+          echo "project=$PROJECT_ID" >> $GITHUB_OUTPUT
+
+      - name: Obtener projectItems del issue
+        id: items
         run: |
           QUERY='
           query {
@@ -47,19 +73,6 @@ jobs:
                     id
                     project {
                       id
-                      title
-                      fields(first: 50) {
-                        nodes {
-                          ... on ProjectV2SingleSelectField {
-                            id
-                            name
-                            options {
-                              id
-                              name
-                            }
-                          }
-                        }
-                      }
                     }
                   }
                 }
@@ -70,22 +83,51 @@ jobs:
           RESPONSE=$(gh api graphql -f query="$QUERY")
           echo "$RESPONSE" > response.json
 
-      - name: Detectar item del proyecto, campo Status y opción In review
-        id: detect
+      - name: Verificar que el issue está en el Project
+        id: verify
         run: |
-          ITEM_ID=$(jq -r '.data.repository.issue.projectItems.nodes[0].id' response.json)
-          PROJECT_ID=$(jq -r '.data.repository.issue.projectItems.nodes[0].project.id' response.json)
+          ITEM_ID=$(jq -r '.data.repository.issue.projectItems.nodes[] | select(.project.id=="'${{ steps.project.outputs.project }}'") | .id' response.json)
 
-          STATUS_FIELD_ID=$(jq -r '.data.repository.issue.projectItems.nodes[0].project.fields.nodes[] | select(.name=="Status") | .id' response.json)
-          IN_REVIEW_OPTION_ID=$(jq -r '.data.repository.issue.projectItems.nodes[0].project.fields.nodes[] | select(.name=="Status") | .options[] | select(.name=="In review") | .id' response.json)
-
-          if [ -z "$ITEM_ID" ] || [ -z "$STATUS_FIELD_ID" ] || [ -z "$IN_REVIEW_OPTION_ID" ]; then
-            echo "No se pudo detectar item, campo Status u opción In review"
+          if [ -z "$ITEM_ID" ]; then
+            echo "El issue no está en el Project. Abortando."
             exit 1
           fi
 
           echo "item=$ITEM_ID" >> $GITHUB_OUTPUT
-          echo "project=$PROJECT_ID" >> $GITHUB_OUTPUT
+
+      - name: Detectar campo Status y opción In review
+        id: detect
+        run: |
+          QUERY='
+          query {
+            node(id: "'${{ steps.project.outputs.project }}'") {
+              ... on ProjectV2 {
+                fields(first: 50) {
+                  nodes {
+                    ... on ProjectV2SingleSelectField {
+                      id
+                      name
+                      options {
+                        id
+                        name
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }'
+
+          RESPONSE=$(gh api graphql -f query="$QUERY")
+
+          STATUS_FIELD_ID=$(echo "$RESPONSE" | jq -r '.data.node.fields.nodes[] | select(.name=="Status") | .id')
+          IN_REVIEW_OPTION_ID=$(echo "$RESPONSE" | jq -r '.data.node.fields.nodes[] | select(.name=="Status") | .options[] | select(.name=="In review") | .id')
+
+          if [ -z "$STATUS_FIELD_ID" ] || [ -z "$IN_REVIEW_OPTION_ID" ]; then
+            echo "No se encontró el campo Status o la opción In review"
+            exit 1
+          fi
+
           echo "status_field=$STATUS_FIELD_ID" >> $GITHUB_OUTPUT
           echo "in_review=$IN_REVIEW_OPTION_ID" >> $GITHUB_OUTPUT
 
@@ -95,8 +137,8 @@ jobs:
           mutation {
             updateProjectV2ItemFieldValue(
               input: {
-                projectId: "'${{ steps.detect.outputs.project }}'",
-                itemId: "'${{ steps.detect.outputs.item }}'",
+                projectId: "'${{ steps.project.outputs.project }}'",
+                itemId: "'${{ steps.verify.outputs.item }}'",
                 fieldId: "'${{ steps.detect.outputs.status_field }}'",
                 value: { singleSelectOptionId: "'${{ steps.detect.outputs.in_review }}'" }
               }
