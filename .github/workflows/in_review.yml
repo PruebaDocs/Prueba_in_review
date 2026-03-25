@@ -2,18 +2,26 @@ name: Move Issue to In Review on PR to develop
 
 on:
   pull_request:
-    types: [opened]
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
     branches:
       - develop
+
 
 jobs:
   move_issue:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: read
+      contents: write
       issues: write
       pull-requests: write
+
+    env:
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Extraer número de issue del cuerpo del PR
@@ -60,7 +68,6 @@ jobs:
           }'
 
           RESPONSE=$(gh api graphql -f query="$QUERY")
-
           echo "$RESPONSE" > response.json
 
       - name: Detectar item del proyecto, campo Status y opción In review
